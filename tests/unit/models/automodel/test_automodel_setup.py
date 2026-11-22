@@ -36,6 +36,7 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _precision_to_dtype,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -720,6 +721,115 @@ class TestValidateAndPrepareConfig:
 
         assert result.hf_config_overrides == {}
 
+    def test_precision_to_dtype_supported(self):
+        """_precision_to_dtype maps each supported name to the right torch.dtype."""
+        assert _precision_to_dtype("float32", "precision") == torch.float32
+        assert _precision_to_dtype("bfloat16", "precision") == torch.bfloat16
+        assert _precision_to_dtype("float16", "precision") == torch.float16
+
+    def test_precision_to_dtype_invalid(self):
+        """_precision_to_dtype raises ValueError on unknown name."""
+        with pytest.raises(ValueError, match="Unknown automodel_cfg.load_precision"):
+            _precision_to_dtype("fp4", "automodel_cfg.load_precision")
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_default_preserves_automatic_dtype(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Unset load_precision preserves optimizer-aware dtype selection."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        assert "load_precision" not in mock_config["automodel_cfg"]
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=True,
+        )
+        assert result.model_load_dtype is None
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_bfloat16_reference_passes(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Reference/teacher workers (init_optimizer=False) can load in bfloat16."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["automodel_cfg"]["load_precision"] = "bfloat16"
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=False,
+        )
+        assert result.model_load_dtype == torch.bfloat16
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_bfloat16_trainable_raises(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        """Trainable workers (init_optimizer=True) must use float32; bfloat16 raises."""
+        mock_config["automodel_cfg"]["load_precision"] = "bfloat16"
+
+        with pytest.raises(
+            ValueError,
+            match="load_precision must be float32 for trainable workers",
+        ):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+                init_optimizer=True,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_passed_to_autoconfig_from_pretrained(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """model_load_dtype is forwarded to AutoConfig.from_pretrained as torch_dtype."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["automodel_cfg"]["load_precision"] = "bfloat16"
+
+        validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=False,
+        )
+        assert mock_autoconfig_class.from_pretrained.called
+        kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert kwargs["torch_dtype"] == torch.bfloat16
+
 
 @pytest.mark.automodel
 class TestSetupReferenceModelState:
@@ -1183,6 +1293,40 @@ class TestSetupModelAndOptimizer:
         assert distributed_setup.activation_checkpointing is False
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    def test_setup_model_load_precision_sets_from_pretrained_dtype(
+        self,
+        mock_get_rank,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """A reference worker loads its checkpoint in automodel_cfg.load_precision."""
+        mock_get_rank.return_value = 0
+        runtime_config = mock_runtime_config._replace(
+            dtype=torch.float32, model_load_dtype=torch.bfloat16
+        )
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {"layer.weight": torch.zeros(10)}
+        mock_model.config.pad_token_id = 0
+        runtime_config.model_class.from_pretrained.return_value = mock_model
+        runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+            is_vlm=False,
+            init_optimizer=False,
+        )
+
+        call_kwargs = runtime_config.model_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.bfloat16
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     def test_restore_from_without_lora_enabled_raises(

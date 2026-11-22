@@ -226,6 +226,19 @@ class AutomodelConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Dtype used when loading weights via from_pretrained. Valid values:
+    # "float32", "bfloat16", "float16". When omitted, optimizer-aware load
+    # dtype selection is preserved. Reference/teacher workers
+    # (init_optimizer=False) can set this to "bfloat16" / "float16" to halve
+    # init-time and resident parameter memory. Trainable workers MUST keep
+    # an explicit override at "float32" to preserve master-weight precision; non-float32
+    # is rejected by validate_and_prepare_config when init_optimizer=True.
+    load_precision: NotRequired[str]
+    # Shard the model before loading its weights instead of loading the
+    # unwrapped model first. Only takes effect when TP=1 and every GPU is in
+    # one context-parallel group (e.g. TP=1, CP=8 on 8 GPUs), where it lowers
+    # peak GPU memory during loading; Automodel already shards first otherwise.
+    shard_before_load: NotRequired[bool]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
@@ -236,6 +249,7 @@ class AutomodelConfig(TypedDict):
 
 class SequencePackingConfigDisabled(TypedDict):
     enabled: Literal[False]
+    fuse_loss: NotRequired[bool]
 
 
 class SequencePackingConfig(TypedDict):
@@ -244,6 +258,7 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    sequence_length_round: NotRequired[int]
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]

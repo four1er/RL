@@ -16,6 +16,7 @@ import asyncio
 import gc
 import itertools
 import json
+import re
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
@@ -2183,6 +2184,122 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion(materialized)
             num_generations=2,
             allow_mixed_agents=False,
         ).add(2, {"row": 2}, resolved_agent_ref=resolved_agent_ref)
+
+
+@pytest.mark.parametrize("returned_rowidxs", [[0], []])
+def test_run_async_nemo_gym_rollout_raises_when_gym_stream_ends_short(
+    returned_rowidxs,
+):
+    """A Gym agent dying mid-rollout must crash training, not yield empty epochs.
+
+    Regression test for #2305: when the Gym agent is killed (e.g. CPU OOM
+    during rollout collection) the actor stream can end after fewer rows than
+    were requested. The rollout must raise instead of returning partial groups
+    and letting training continue with empty epochs.
+    """
+
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _AsyncOnlyStream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                value = next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+            return value
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, timer_prefix, deduplicate_multimodal_data):
+            del rows, timer_prefix, deduplicate_multimodal_data
+            values = []
+            for rowidx in returned_rowidxs:
+                result = {
+                    "rowidx": rowidx,
+                    "input_message_log": [{"role": "user", "token_ids": [rowidx]}],
+                    "message_log": [
+                        {"role": "user", "token_ids": [rowidx]},
+                        {
+                            "role": "assistant",
+                            "token_ids": [rowidx],
+                            "generation_logprobs": [0.0],
+                        },
+                    ],
+                }
+                values.append(_ReadyRef((rowidx, {"name": "agent"}, result, None)))
+            return _AsyncOnlyStream(values)
+
+    class _PolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 128}}
+
+    rows = []
+    for task_index in (10, 10, 11, 11):
+        rows.append(
+            {
+                "task_source": "workplace_assistant",
+                "responses_create_params": {},
+                "_ng_task_index": task_index,
+                "agent_ref": {"name": "agent"},
+            }
+        )
+    input_batch = BatchedDataDict({"extra_env_info": rows})
+
+    async def _collect():
+        results = []
+        async for result in run_async_nemo_gym_rollout(
+            policy_generation=_PolicyGeneration(),
+            input_batch=input_batch,
+            tokenizer=None,
+            task_to_env={
+                "nemo_gym": type(
+                    "_Environment",
+                    (),
+                    {"run_rollouts": _RunRolloutsRemote()},
+                )()
+            },
+            generation_config={
+                "stop_strings": [],
+                "stop_token_ids": [],
+                "top_k": None,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "val_temperature": 1.0,
+                "val_top_p": 1.0,
+                "val_top_k": None,
+                "max_new_tokens": 32,
+            },
+            num_generations=2,
+            log_full_result_tables=False,
+        ):
+            results.append(result)
+        return results
+
+    missing = sorted(set(range(4)) - set(returned_rowidxs))
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape(
+            "NeMo-Gym rollout stream ended before all rows arrived; "
+            f"missing row indices {missing}"
+        ),
+    ):
+        asyncio.run(_collect())
 
 
 @pytest.mark.parametrize("materialized", [False, True])

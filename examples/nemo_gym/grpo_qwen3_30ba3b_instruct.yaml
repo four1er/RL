@@ -4,10 +4,15 @@ grpo:
   max_num_epochs: 10
   # We observe MoE likes more data per optimization step. Here we increase the num prompts per step from the dense 64 to 256.
   # We retain the 16 generations per prompt for now. Later on this may change for agentic tasks as the action/sample space grows.
-  # We take up to 16 steps off policy, which is 256 * 16 = 4096
-  num_prompts_per_step: 4096
+  # One rollout step collects 256 prompts * 16 generations = 4096 rollouts in a
+  # single Gym dispatch, which is exactly one optimizer step
+  # (policy.train_global_batch_size). Do not raise this to 4096: that dispatched
+  # 4096 * 16 = 65536 rows in a single run_rollouts call, CPU-OOMing rollout
+  # collection and killing the Gym agent while training logged empty epochs
+  # (see https://github.com/NVIDIA-NeMo/RL/issues/2305).
+  num_prompts_per_step: 256
   num_generations_per_prompt: 16
-  # Each "step" in NeMo RL is all 16 minibatch steps we want to take. So we val and save every step.
+  # Each step is a single optimizer step over one rollout batch, so we val and save every step.
   val_period: 1
   # The advantages are much larger and this becomes non-trivially expensive.
   calculate_advantages_on_gpu: true
@@ -33,7 +38,7 @@ policy:
   logprob_chunk_size: null
 
   # This is one minibatch, which is 256 prompts per step * 16 rollouts per prompt.
-  train_global_batch_size: 4096
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
 
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
   max_total_sequence_length: 32768
